@@ -1,0 +1,11 @@
+.env
+.DS_Store
+# rsconnect shiny app
+rsconnect
+# RStudio files
+.Rproj.user
+# R environment
+.Rhistory
+# R temporary files
+.RData
+.Ruserdata
