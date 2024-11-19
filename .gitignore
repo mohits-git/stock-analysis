@@ -9,3 +9,6 @@ rsconnect
 # R temporary files
 .RData
 .Ruserdata
+
+## SQLite Database
+src/users.db
