@@ -12,6 +12,9 @@ library(DBI)
 library(RSQLite)
 library(sodium) # for password hashing
 library(shinyjs)
+library(googleAuthR)
+library(httr)
+library(jsonlite)
 
 # Declare preferences for conflicting functions
 conflicts_prefer(
@@ -23,8 +26,16 @@ conflicts_prefer(
   dplyr::union,
   shinydashboard::box,
   plotly::layout,
-  shiny::observe
+  shiny::observe,
+  httr::config
 )
+
+# ENVs
+readRenviron("../.env")
+
+google_client_id <- Sys.getenv("GOOGLE_CLIENT_ID")
+google_client_secret <- Sys.getenv("GOOGLE_CLIENT_SECRET")
+google_redirect_uri <- Sys.getenv("GOOGLE_REDIRECT_URI")
 
 # Initialize SQLite database for users
 init_db <- function() {
@@ -34,9 +45,12 @@ init_db <- function() {
   if (!dbExistsTable(con, "users")) {
     dbExecute(con, "CREATE TABLE users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT UNIQUE NOT NULL,
-      password TEXT NOT NULL,
+      username TEXT UNIQUE,
+      password TEXT,
       email TEXT UNIQUE NOT NULL,
+      google_id TEXT UNIQUE,
+      google_email TEXT,
+      profile_picture TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )")
   }
@@ -138,6 +152,15 @@ loginPageUI <- function() {
       ),
       div(class = "auth-message", textOutput("login_message")),
       actionButton("login_btn", "Login", class = "auth-btn login-btn"),
+      tags$hr(style = "margin: 20px 0;"),
+      div(class = "auth-switch",
+        "Or sign in with:",
+        actionButton("google_signin", "Sign in with Google",
+          class = "auth-btn",
+          style = "background-color: #4285f4; margin-top: 10px;",
+          icon = icon("google")
+        )
+      ),
       div(class = "auth-switch",
         "Don't have an account?",
         actionLink("go_to_signup", "Sign up")
@@ -427,8 +450,215 @@ dashboardUI <- function() {
 ui <- function() {
   fluidPage(
     useShinyjs(),
+    tags$head(
+      tags$script("
+        Shiny.addCustomMessageHandler('redirectToGoogle', function(authUrl) {
+          window.location.href = authUrl;
+        });
+      ")
+    ),
     uiOutput("currentPage")
   )
+}
+
+## Google OAuth
+# Add these Google authentication functions
+setup_google_auth <- function() {
+  options(googleAuthR.scopes.selected = c(
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile"
+  ))
+  
+  # Replace with your OAuth credentials
+  options(googleAuthR.webapp.client_id =google_client_id,
+          googleAuthR.webapp.client_secret =google_client_secret,
+          googleAuthR.webapp.redirect_uri =google_redirect_uri)
+  # Configure for same window authentication
+  # options(googleAuthR.webapp.use_basic_auth = TRUE,
+  #         googleAuthR.webapp.redirect_on_signout = TRUE,
+  #         googleAuthR.webapp.popup = FALSE)
+}
+
+# Modify the handle_google_auth function to handle the OAuth code
+handle_google_auth <- function(code, session) {
+  # Exchange the authorization code for an access token
+  token_response <- POST(
+    "https://oauth2.googleapis.com/token",
+    body = list(
+      code = code,
+      client_id = google_client_id,
+      client_secret = google_client_secret,
+      redirect_uri = "http://localhost:6740",
+      grant_type = "authorization_code"
+    ),
+    encode = "form"
+  )
+  
+  if (status_code(token_response) == 200) {
+    token_data <- fromJSON(rawToChar(token_response$content))
+    access_token <- token_data$access_token
+    
+    # Get user info using the access token
+    user_info_response <- GET(
+      "https://www.googleapis.com/oauth2/v1/userinfo",
+      add_headers(Authorization = paste("Bearer", access_token))
+    )
+    
+    if (status_code(user_info_response) == 200) {
+      user_info <- fromJSON(rawToChar(user_info_response$content))
+      
+      # Connect to database
+      con <- dbConnect(RSQLite::SQLite(), "users.db")
+      
+      # Check if user exists
+      existing_user <- dbGetQuery(con, sprintf(
+        "SELECT * FROM users WHERE google_id = '%s' OR email = '%s'",
+        user_info$id, user_info$email
+      ))
+      
+      if (nrow(existing_user) == 0) {
+        # Create new user
+        dbExecute(con, 
+          "INSERT INTO users (username, email, google_id, google_email, profile_picture) 
+           VALUES (?, ?, ?, ?, ?)",
+          params = list(
+            user_info$email,
+            user_info$email,
+            user_info$id,
+            user_info$email,
+            user_info$picture
+          )
+        )
+        
+        # Get the newly created user
+        user <- dbGetQuery(con, sprintf(
+          "SELECT * FROM users WHERE google_id = '%s'",
+          user_info$id
+        ))
+      } else {
+        # Update existing user's Google info
+        dbExecute(con,
+          "UPDATE users SET 
+           google_id = ?, 
+           google_email = ?, 
+           profile_picture = ? 
+           WHERE email = ?",
+          params = list(
+            user_info$id,
+            user_info$email,
+            user_info$picture,
+            user_info$email
+          )
+        )
+        user <- existing_user
+      }
+      
+      dbDisconnect(con)
+      
+      return(list(
+        username = user_info$email,
+        email = user_info$email,
+        profile_picture = user_info$picture
+      ))
+    }
+  }
+  return(NULL)
+}
+
+get_google_user_info <- function(access_token) {
+  # Get user info from Google using the access token directly in the header
+  response <- GET(
+    "https://www.googleapis.com/oauth2/v1/userinfo",
+    add_headers(Authorization = paste("Bearer", access_token))
+  )
+  
+  if (status_code(response) == 200) {
+    user_info <- fromJSON(rawToChar(response$content))
+    return(user_info)
+  }
+  return(NULL)
+}
+
+# Handle the OAuth code exchange and user authentication
+handle_google_auth <- function(code, session) {
+  # Exchange the authorization code for an access token
+  token_response <- POST(
+    "https://oauth2.googleapis.com/token",
+    body = list(
+      code = code,
+      client_id = google_client_id,
+      client_secret = google_client_secret,
+      redirect_uri = google_redirect_uri,
+      grant_type = "authorization_code"
+    ),
+    encode = "form"
+  )
+  
+  if (status_code(token_response) == 200) {
+    token_data <- fromJSON(rawToChar(token_response$content))
+    access_token <- token_data$access_token
+    
+    # Get user info using the access token
+    user_info <- get_google_user_info(access_token)
+    
+    if (!is.null(user_info)) {
+      # Connect to database
+      con <- dbConnect(RSQLite::SQLite(), "users.db")
+      
+      # Check if user exists
+      existing_user <- dbGetQuery(con, sprintf(
+        "SELECT * FROM users WHERE google_id = '%s' OR email = '%s'",
+        user_info$id, user_info$email
+      ))
+      
+      if (nrow(existing_user) == 0) {
+        # Create new user
+        dbExecute(con, 
+          "INSERT INTO users (username, email, google_id, google_email, profile_picture) 
+           VALUES (?, ?, ?, ?, ?)",
+          params = list(
+            user_info$email,
+            user_info$email,
+            user_info$id,
+            user_info$email,
+            user_info$picture
+          )
+        )
+        
+        # Get the newly created user
+        user <- dbGetQuery(con, sprintf(
+          "SELECT * FROM users WHERE google_id = '%s'",
+          user_info$id
+        ))
+      } else {
+        # Update existing user's Google info
+        dbExecute(con,
+          "UPDATE users SET 
+           google_id = ?, 
+           google_email = ?, 
+           profile_picture = ? 
+           WHERE email = ?",
+          params = list(
+            user_info$id,
+            user_info$email,
+            user_info$picture,
+            user_info$email
+          )
+        )
+        user <- existing_user
+      }
+      
+      dbDisconnect(con)
+      
+      # Return user data
+      return(list(
+        username = user_info$email,
+        email = user_info$email,
+        profile_picture = user_info$picture
+      ))
+    }
+  }
+  return(NULL)
 }
 
 # Server logic
@@ -436,7 +666,43 @@ server <- function(input, output, session) {
     # Initialize page state
   appState <- reactiveVal("landing")
   user_data <- reactiveVal(NULL)
+
+  # Setup Google Authentication
+  setup_google_auth()
+
+   # Handle Google Sign-In button click
+  observeEvent(input$google_signin, {
+    # Create OAuth URL
+    auth_url <- paste0(
+      "https://accounts.google.com/o/oauth2/v2/auth?",
+      "client_id=", google_client_id,
+      "&redirect_uri=", URLencode("http://localhost:6740", reserved = TRUE),
+      "&response_type=code",
+      "&scope=", URLencode("email profile openid https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/userinfo.email", reserved = TRUE)
+    )
+    
+    # Redirect to Google login
+    session$sendCustomMessage("redirectToGoogle", auth_url)
+  })
   
+  # Handle the OAuth callback observer
+  observe({
+    query <- parseQueryString(session$clientData$url_search)
+    
+    if (!is.null(query$code)) {
+      # Handle the authorization code
+      user <- handle_google_auth(query$code, session)
+      
+      if (!is.null(user)) {
+        user_data(user)
+        appState("dashboard")
+      } else {
+        output$login_message <- renderText("Failed to authenticate with Google")
+        appState("login")
+      }
+    }
+  })
+
   # Handle page transitions
   observeEvent(input$getStarted, {
     appState("login")
@@ -570,26 +836,6 @@ server <- function(input, output, session) {
     }
   )
 
-  # Render the appropriate UI based on state
-  # output$currentPage <- renderUI({
-  #   if (appState() == "landing") {
-  #     landingPageUI()
-  #   } else {
-  #     dashboardUI()
-  #   }
-  # })
-
-  # # Your existing server logic - only runs when in dashboard mode
-  # observe({
-  #   req(appState() == "dashboard")
-  #   # Original server code here
-  #   data <- stock_data()
-  #   if (!is.null(data)) {
-  #     updateSelectInput(session, "stock", choices = unique(data$Index), selected = unique(data$Index)[1])
-  #     updateDateRangeInput(session, "date_range", start = min(data$Date), end = max(data$Date))
-  #   }
-  # })
-
   # Load data from user-uploaded file
   stock_data <- reactive({
     if (!is.null(input$file)) {
@@ -623,15 +869,7 @@ server <- function(input, output, session) {
     req(stock_data())
     summary(stock_data())
   })
-  
-  # observe({
-  #   data <- stock_data()
-  #   if (!is.null(data)) {
-  #     updateSelectInput(session, "stock", choices = unique(data$Index), selected = unique(data$Index)[1])
-  #     updateDateRangeInput(session, "date_range", start = min(data$Date), end = max(data$Date))
-  #   }
-  # })
-  
+
   output$avgCloseChart <- renderPlotly({
     req(filtered_data())
     avg_close <- filtered_data() %>%
