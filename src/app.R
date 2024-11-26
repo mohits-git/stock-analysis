@@ -322,7 +322,18 @@ landingPageUI <- function() {
 dashboardUI <- function() {
   dashboardPage(
     skin = "blue",
-    dashboardHeader(title = "Stock Analysis Dashboard"),
+    dashboardHeader(
+      title = "Stock Analysis Dashboard", 
+      tags$li(
+        class = "dropdown",
+        actionButton(
+          "logout_btn", 
+          "Logout", 
+          icon = icon("sign-out-alt"),
+          style = "margin-top: 8px; margin-right: 10px; background-color: #e74c3c; color: white;"
+        )
+      )
+    ),
     dashboardSidebar(
       tags$style(HTML("
         /* Sidebar Styling */
@@ -669,6 +680,18 @@ server <- function(input, output, session) {
 
   # Setup Google Authentication
   setup_google_auth()
+
+  # Then in the server function, add a logout observer
+  observeEvent(input$logout_btn, {
+    # Clear user data
+    user_data(NULL)
+    
+    # Reset app state to landing page
+    appState("landing")
+    
+    # Optional: Show a logout notification
+    showNotification("You have been logged out.", type = "message")
+  })
 
    # Handle Google Sign-In button click
   observeEvent(input$google_signin, {
