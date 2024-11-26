@@ -15,6 +15,8 @@ library(shinyjs)
 library(googleAuthR)
 library(httr)
 library(jsonlite)
+library(shinyjs)
+library(cookies)
 
 # Declare preferences for conflicting functions
 conflicts_prefer(
@@ -60,6 +62,88 @@ init_db <- function() {
 
 # Initialize database
 init_db()
+
+# Session management functions
+create_session_token <- function() {
+  paste0(sample(c(letters, LETTERS, 0:9), 32, replace = TRUE), collapse = "")
+}
+
+save_session <- function(user_data, session_token) {
+  con <- dbConnect(RSQLite::SQLite(), "users.db")
+  
+  tryCatch({
+    # Add sessions table if it doesn't exist
+    if (!dbExistsTable(con, "sessions")) {
+      dbExecute(con, "CREATE TABLE sessions (
+        token TEXT PRIMARY KEY,
+        username TEXT,
+        email TEXT,
+        profile_picture TEXT,
+        auth_type TEXT,
+        access_token TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMP
+      )")
+    }
+    
+    # Prepare session data
+    expires_at <- as.character(Sys.time() + as.difftime(1, units="days"))
+    
+    # Delete any existing session for this user
+    dbExecute(con, "DELETE FROM sessions WHERE email = ?", 
+             params = list(user_data$email))
+    
+    # Insert new session
+    dbExecute(con,
+      "INSERT INTO sessions (token, username, email, profile_picture, auth_type, expires_at) 
+       VALUES (?, ?, ?, ?, ?, ?)",
+      params = list(
+        session_token,
+        user_data$username,
+        user_data$email,
+        ifelse(is.null(user_data$profile_picture), NA, user_data$profile_picture),
+        ifelse(is.null(user_data$auth_type), "regular", user_data$auth_type),
+        expires_at
+      )
+    )
+    
+  }, error = function(e) {
+    print(paste("Error saving session:", e$message))
+    print(str(user_data))
+  }, finally = {
+    dbDisconnect(con)
+  })
+}
+
+get_session <- function(session_token) {
+  con <- dbConnect(RSQLite::SQLite(), "users.db")
+  
+  tryCatch({
+    # Get session data
+    session <- dbGetQuery(con, 
+      "SELECT * FROM sessions 
+       WHERE token = ? AND expires_at > datetime('now')",
+      params = list(session_token)
+    )
+    
+    if (nrow(session) > 0) {
+      return(list(
+        username = session$username,
+        email = session$email,
+        profile_picture = session$profile_picture,
+        auth_type = session$auth_type
+      ))
+    } else {
+      return(NULL)
+    }
+    
+  }, error = function(e) {
+    print(paste("Error getting session:", e$message))
+    return(NULL)
+  }, finally = {
+    dbDisconnect(con)
+  })
+}
 
 # Authentication functions
 hash_password <- function(password) {
@@ -466,6 +550,16 @@ ui <- function() {
         Shiny.addCustomMessageHandler('redirectToGoogle', function(authUrl) {
           window.location.href = authUrl;
         });
+        Shiny.addCustomMessageHandler('setCookie', function(data) {
+          document.cookie = data.name + '=' + data.value + ';path=/';
+        });
+        Shiny.addCustomMessageHandler('getCookie', function(name) {
+          const value = `; ${document.cookie}`;
+          const parts = value.split(`; ${name}=`);
+          if (parts.length === 2) {
+            Shiny.setInputValue('cookie_' + name, parts.pop().split(';').shift());
+          }
+        });
       ")
     ),
     uiOutput("currentPage")
@@ -473,107 +567,27 @@ ui <- function() {
 }
 
 ## Google OAuth
-# Add these Google authentication functions
 setup_google_auth <- function() {
   options(googleAuthR.scopes.selected = c(
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile"
   ))
   
-  # Replace with your OAuth credentials
   options(googleAuthR.webapp.client_id =google_client_id,
           googleAuthR.webapp.client_secret =google_client_secret,
           googleAuthR.webapp.redirect_uri =google_redirect_uri)
-  # Configure for same window authentication
-  # options(googleAuthR.webapp.use_basic_auth = TRUE,
-  #         googleAuthR.webapp.redirect_on_signout = TRUE,
-  #         googleAuthR.webapp.popup = FALSE)
 }
 
-# Modify the handle_google_auth function to handle the OAuth code
-handle_google_auth <- function(code, session) {
-  # Exchange the authorization code for an access token
-  token_response <- POST(
-    "https://oauth2.googleapis.com/token",
-    body = list(
-      code = code,
-      client_id = google_client_id,
-      client_secret = google_client_secret,
-      redirect_uri = "http://localhost:6740",
-      grant_type = "authorization_code"
-    ),
-    encode = "form"
+verify_google_token <- function(token) {
+  response <- GET(
+    paste0("https://oauth2.googleapis.com/tokeninfo?access_token=", token)
   )
   
-  if (status_code(token_response) == 200) {
-    token_data <- fromJSON(rawToChar(token_response$content))
-    access_token <- token_data$access_token
-    
-    # Get user info using the access token
-    user_info_response <- GET(
-      "https://www.googleapis.com/oauth2/v1/userinfo",
-      add_headers(Authorization = paste("Bearer", access_token))
-    )
-    
-    if (status_code(user_info_response) == 200) {
-      user_info <- fromJSON(rawToChar(user_info_response$content))
-      
-      # Connect to database
-      con <- dbConnect(RSQLite::SQLite(), "users.db")
-      
-      # Check if user exists
-      existing_user <- dbGetQuery(con, sprintf(
-        "SELECT * FROM users WHERE google_id = '%s' OR email = '%s'",
-        user_info$id, user_info$email
-      ))
-      
-      if (nrow(existing_user) == 0) {
-        # Create new user
-        dbExecute(con, 
-          "INSERT INTO users (username, email, google_id, google_email, profile_picture) 
-           VALUES (?, ?, ?, ?, ?)",
-          params = list(
-            user_info$email,
-            user_info$email,
-            user_info$id,
-            user_info$email,
-            user_info$picture
-          )
-        )
-        
-        # Get the newly created user
-        user <- dbGetQuery(con, sprintf(
-          "SELECT * FROM users WHERE google_id = '%s'",
-          user_info$id
-        ))
-      } else {
-        # Update existing user's Google info
-        dbExecute(con,
-          "UPDATE users SET 
-           google_id = ?, 
-           google_email = ?, 
-           profile_picture = ? 
-           WHERE email = ?",
-          params = list(
-            user_info$id,
-            user_info$email,
-            user_info$picture,
-            user_info$email
-          )
-        )
-        user <- existing_user
-      }
-      
-      dbDisconnect(con)
-      
-      return(list(
-        username = user_info$email,
-        email = user_info$email,
-        profile_picture = user_info$picture
-      ))
-    }
+  if (status_code(response) == 200) {
+    token_info <- fromJSON(rawToChar(response$content))
+    return(!is.null(token_info$email))
   }
-  return(NULL)
+  return(FALSE)
 }
 
 get_google_user_info <- function(access_token) {
@@ -590,88 +604,6 @@ get_google_user_info <- function(access_token) {
   return(NULL)
 }
 
-# Handle the OAuth code exchange and user authentication
-handle_google_auth <- function(code, session) {
-  # Exchange the authorization code for an access token
-  token_response <- POST(
-    "https://oauth2.googleapis.com/token",
-    body = list(
-      code = code,
-      client_id = google_client_id,
-      client_secret = google_client_secret,
-      redirect_uri = google_redirect_uri,
-      grant_type = "authorization_code"
-    ),
-    encode = "form"
-  )
-  
-  if (status_code(token_response) == 200) {
-    token_data <- fromJSON(rawToChar(token_response$content))
-    access_token <- token_data$access_token
-    
-    # Get user info using the access token
-    user_info <- get_google_user_info(access_token)
-    
-    if (!is.null(user_info)) {
-      # Connect to database
-      con <- dbConnect(RSQLite::SQLite(), "users.db")
-      
-      # Check if user exists
-      existing_user <- dbGetQuery(con, sprintf(
-        "SELECT * FROM users WHERE google_id = '%s' OR email = '%s'",
-        user_info$id, user_info$email
-      ))
-      
-      if (nrow(existing_user) == 0) {
-        # Create new user
-        dbExecute(con, 
-          "INSERT INTO users (username, email, google_id, google_email, profile_picture) 
-           VALUES (?, ?, ?, ?, ?)",
-          params = list(
-            user_info$email,
-            user_info$email,
-            user_info$id,
-            user_info$email,
-            user_info$picture
-          )
-        )
-        
-        # Get the newly created user
-        user <- dbGetQuery(con, sprintf(
-          "SELECT * FROM users WHERE google_id = '%s'",
-          user_info$id
-        ))
-      } else {
-        # Update existing user's Google info
-        dbExecute(con,
-          "UPDATE users SET 
-           google_id = ?, 
-           google_email = ?, 
-           profile_picture = ? 
-           WHERE email = ?",
-          params = list(
-            user_info$id,
-            user_info$email,
-            user_info$picture,
-            user_info$email
-          )
-        )
-        user <- existing_user
-      }
-      
-      dbDisconnect(con)
-      
-      # Return user data
-      return(list(
-        username = user_info$email,
-        email = user_info$email,
-        profile_picture = user_info$picture
-      ))
-    }
-  }
-  return(NULL)
-}
-
 # Server logic
 server <- function(input, output, session) {
     # Initialize page state
@@ -681,47 +613,154 @@ server <- function(input, output, session) {
   # Setup Google Authentication
   setup_google_auth()
 
+    
+  # Check for existing session on startup
+  observe({
+    session$sendCustomMessage("getCookie", "session_token")
+  })
+  
+  observeEvent(input$cookie_session_token, {
+    if (!is.null(input$cookie_session_token)) {
+      session_data <- get_session(input$cookie_session_token)
+      if (!is.null(session_data)) {
+        user_data(session_data)
+        appState("dashboard")
+      }
+    }
+  })
+
   # Then in the server function, add a logout observer
   observeEvent(input$logout_btn, {
+    # Clear session token cookie
+    session$sendCustomMessage("setCookie", list(
+      name = "session_token",
+      value = ""
+    ))
+    
     # Clear user data
     user_data(NULL)
     
     # Reset app state to landing page
     appState("landing")
     
-    # Optional: Show a logout notification
     showNotification("You have been logged out.", type = "message")
   })
 
    # Handle Google Sign-In button click
-  observeEvent(input$google_signin, {
-    # Create OAuth URL
+    observeEvent(input$google_signin, {
     auth_url <- paste0(
       "https://accounts.google.com/o/oauth2/v2/auth?",
       "client_id=", google_client_id,
-      "&redirect_uri=", URLencode("http://localhost:6740", reserved = TRUE),
+      "&redirect_uri=", URLencode(google_redirect_uri, reserved = TRUE),
       "&response_type=code",
-      "&scope=", URLencode("email profile openid https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/userinfo.email", reserved = TRUE)
+      "&scope=", URLencode("email profile openid", reserved = TRUE),
+      "&prompt=select_account"  # Force Google account selection
     )
-    
-    # Redirect to Google login
     session$sendCustomMessage("redirectToGoogle", auth_url)
   })
   
   # Handle the OAuth callback observer
-  observe({
+   observe({
     query <- parseQueryString(session$clientData$url_search)
     
     if (!is.null(query$code)) {
-      # Handle the authorization code
-      user <- handle_google_auth(query$code, session)
+      # Exchange code for token
+      token_response <- POST(
+        "https://oauth2.googleapis.com/token",
+        body = list(
+          code = query$code,
+          client_id = google_client_id,
+          client_secret = google_client_secret,
+          redirect_uri = google_redirect_uri,
+          grant_type = "authorization_code"
+        ),
+        encode = "form"
+      )
       
-      if (!is.null(user)) {
-        user_data(user)
-        appState("dashboard")
-      } else {
-        output$login_message <- renderText("Failed to authenticate with Google")
-        appState("login")
+      if (status_code(token_response) == 200) {
+        token_data <- fromJSON(rawToChar(token_response$content))
+        access_token <- token_data$access_token
+        
+        # Get user info
+        user_info_response <- GET(
+          "https://www.googleapis.com/oauth2/v1/userinfo",
+          add_headers(Authorization = paste("Bearer", access_token))
+        )
+        
+        if (status_code(user_info_response) == 200) {
+          user_info <- fromJSON(rawToChar(user_info_response$content))
+          
+          # Connect to database
+          con <- dbConnect(RSQLite::SQLite(), "users.db")
+          
+          tryCatch({
+            # Check if user exists
+            existing_user <- dbGetQuery(con, sprintf(
+              "SELECT * FROM users WHERE google_id = '%s' OR email = '%s'",
+              user_info$id, user_info$email
+            ))
+            
+            if (nrow(existing_user) == 0) {
+              # Create new user
+              dbExecute(con, 
+                "INSERT INTO users (username, email, google_id, google_email, profile_picture) 
+                 VALUES (?, ?, ?, ?, ?)",
+                params = list(
+                  user_info$email,
+                  user_info$email,
+                  user_info$id,
+                  user_info$email,
+                  user_info$picture
+                )
+              )
+            } else {
+              # Update existing user
+              dbExecute(con,
+                "UPDATE users SET 
+                 google_id = ?, 
+                 google_email = ?, 
+                 profile_picture = ? 
+                 WHERE email = ?",
+                params = list(
+                  user_info$id,
+                  user_info$email,
+                  user_info$picture,
+                  user_info$email
+                )
+              )
+            }
+            
+            # Create session token
+            session_token <- create_session_token()
+            
+            # Prepare user data
+            user_info_list <- list(
+              username = user_info$email,
+              email = user_info$email,
+              profile_picture = user_info$picture,
+              auth_type = "google"
+            )
+            
+            # Save session
+            save_session(user_info_list, session_token)
+            
+            # Set cookie
+            session$sendCustomMessage("setCookie", list(
+              name = "session_token",
+              value = session_token
+            ))
+            
+            # Update reactive values
+            user_data(user_info_list)
+            appState("dashboard")
+            
+          }, error = function(e) {
+            print(paste("Error in Google authentication:", e$message))
+            output$login_message <- renderText("Error during Google authentication")
+          }, finally = {
+            dbDisconnect(con)
+          })
+        }
       }
     }
   })
@@ -776,25 +815,43 @@ server <- function(input, output, session) {
   })
   
   # Handle login
-  observeEvent(input$login_btn, {
-    req(input$login_username, input$login_password)
+  # Modify your login handler
+observeEvent(input$login_btn, {
+  req(input$login_username, input$login_password)
+  
+  tryCatch({
+    con <- dbConnect(RSQLite::SQLite(), "users.db")
+    user <- dbGetQuery(con, sprintf("SELECT * FROM users WHERE username = '%s'", input$login_username))
+    dbDisconnect(con)
     
-    tryCatch({
-      con <- dbConnect(RSQLite::SQLite(), "users.db")
-      user <- dbGetQuery(con, sprintf("SELECT * FROM users WHERE username = '%s'", input$login_username))
-      dbDisconnect(con)
+    if (nrow(user) == 1 && verify_password(input$login_password, user$password)) {
+      # Create and save session
+      session_token <- create_session_token()
+      user_info <- list(
+        username = user$username,
+        email = user$email,
+        auth_type = "regular",
+        profile_picture = NULL
+      )
       
-      if (nrow(user) == 1 && verify_password(input$login_password, user$password)) {
-        user_data(list(username = user$username, email = user$email))
-        appState("dashboard")
-      } else {
-        output$login_message <- renderText("Invalid username or password!")
-      }
+      save_session(user_info, session_token)
       
-    }, error = function(e) {
-      output$login_message <- renderText("An error occurred during login.")
-    })
+      # Set cookie in browser
+      session$sendCustomMessage("setCookie", list(
+        name = "session_token",
+        value = session_token
+      ))
+      
+      user_data(user_info)
+      appState("dashboard")
+    } else {
+      output$login_message <- renderText("Invalid username or password!")
+    }
+  }, error = function(e) {
+    print(paste("Error in login handler:", e$message))
+    output$login_message <- renderText("An error occurred during login.")
   })
+})
 
   # Render the appropriate page based on state
   output$currentPage <- renderUI({
